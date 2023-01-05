@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -24,7 +25,17 @@ import (
 )
 
 // save the latency from this node to other nodes
-var nodeLatency = map[string]float64{}
+type nodesDistance struct {
+	mu            sync.Mutex
+	nodesdistance map[string]float64
+}
+
+var nodeLatency = &nodesDistance{
+	nodesdistance: make(map[string]float64),
+}
+
+// master ip
+var masterIp string = ""
 
 type nodeBaseInformation struct {
 	nodeName string
@@ -34,6 +45,7 @@ type nodeBaseInformation struct {
 type controller struct {
 	nodeLister listerv1.NodeLister
 	workQueue  []nodeBaseInformation
+	mu         sync.Mutex
 }
 
 func main() {
@@ -86,40 +98,47 @@ func main() {
 		DeleteFunc: ctl.delete,
 	})
 
-	// nodeList, err := c.nodeLister.List(labels.Everything())
-	// if err != nil {
-	// 	fmt.Println(err)
-	// }
-	// nodeNameList := []string{}
-	// for _, node := range nodeList {
-	// 	nodeNameList = append(nodeNameList, node.Status.Addresses[0].Address)
-	// }
-	// fmt.Println("nodelist:", nodeNameList)
-
 	go ctl.runWorker()
 	<-stopper
 }
 
+// add will add the new node to the workQueue.
 func (c *controller) add(obj interface{}) {
 	node := obj.(*corev1.Node)
-	//fmt.Println("add a node:", node.Name)
-	if _, ok := nodeLatency[node.Name]; ok {
+
+	nodeLatency.mu.Lock()
+	if _, ok := nodeLatency.nodesdistance[node.Name]; ok {
 		return
+	}
+	nodeLatency.mu.Unlock()
+
+	// if this node is master, record its ip
+	if _, ok := node.Labels["node-role.kubernetes.io/control-plane"]; ok {
+		masterIp = node.Status.Addresses[0].Address
+	}
+	if _, ok := node.Labels["node-role.kubernetes.io/master"]; ok {
+		masterIp = node.Status.Addresses[0].Address
 	}
 
 	newNode := nodeBaseInformation{
 		nodeName: node.Name,
 		nodeIp:   node.Status.Addresses[0].Address,
 	}
+	c.mu.Lock()
 	c.workQueue = append(c.workQueue, newNode)
+	c.mu.Unlock()
 
 }
 
+// delete will delete the related data about the deleted node.
 func (c *controller) delete(obj interface{}) {
 	node := obj.(*corev1.Node)
-	delete(nodeLatency, node.Name)
+	nodeLatency.mu.Lock()
+	delete(nodeLatency.nodesdistance, node.Name)
+	nodeLatency.mu.Unlock()
 }
 
+// run the processsItem function in a loop.
 func (c *controller) runWorker() {
 	for {
 		c.processItem()
@@ -130,15 +149,18 @@ func (c *controller) processItem() {
 	newNodeNums := 0
 	newNodeLatency := map[string]float64{}
 	for len(c.workQueue) > 0 {
+		c.mu.Lock()
 		newNodeNums++
 		newNode := c.workQueue[0]
-		// here the queue operation may need a lock
 		c.workQueue = c.workQueue[1:]
 
 		// calculate the latency to this node
 		t := latency.GetNodeLatency(newNode.nodeIp)
-		nodeLatency[newNode.nodeName] = t.Seconds() * 1e3 // ms
+		nodeLatency.mu.Lock()
+		nodeLatency.nodesdistance[newNode.nodeName] = t.Seconds() * 1e3 // ms
+		nodeLatency.mu.Unlock()
 		newNodeLatency[newNode.nodeName] = t.Seconds() * 1e3
+		c.mu.Unlock()
 	}
 
 	// Notify the master of new information
@@ -153,6 +175,7 @@ type result struct {
 	Status string `json:"status"`
 }
 
+// Notify the master of the network distance information to the new nodes.
 func notifyMasterNewInformation(newNodeLatency map[string]float64) {
 	hostName, err := os.Hostname()
 	if err != nil {
@@ -165,7 +188,8 @@ func notifyMasterNewInformation(newNodeLatency map[string]float64) {
 
 	bytesData, _ := json.Marshal(data)
 
-	resp, err := http.Post("http://127.0.0.1:8000/go", "application/json", bytes.NewReader(bytesData))
+	masterUrl := "http://" + masterIp + ":8000/go"
+	resp, err := http.Post(masterUrl, "application/json", bytes.NewReader(bytesData))
 	if err != nil {
 		fmt.Printf("error is %v", err)
 		os.Exit(0)
